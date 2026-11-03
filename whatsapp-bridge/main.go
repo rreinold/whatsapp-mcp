@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -123,6 +124,27 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// Apply an edit to a stored message. Returns true if the original was already stored
+// (text updated in place); false if it was missed, in which case the edited text is
+// inserted so it is not lost.
+func (store *MessageStore) ApplyEdit(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool) (bool, error) {
+	res, err := store.db.Exec(
+		"UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?",
+		content, id, chatJID,
+	)
+	if err != nil {
+		return false, err
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if updated > 0 {
+		return true, nil
+	}
+	return false, store.StoreMessage(id, chatJID, sender, content, timestamp, isFromMe, "", "", "", nil, nil, nil, 0)
 }
 
 // Get messages from a chat
@@ -424,6 +446,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Edits arrive as a protocol message pointing at the original message id
+	if pm := msg.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		handleEdit(messageStore, msg, pm, chatJID, sender, logger)
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -468,6 +496,26 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+	}
+}
+
+func handleEdit(messageStore *MessageStore, msg *events.Message, pm *waProto.ProtocolMessage, chatJID, sender string, logger waLog.Logger) {
+	originalID := pm.GetKey().GetID()
+	content := extractTextContent(pm.GetEditedMessage())
+	if originalID == "" || content == "" {
+		logger.Warnf("Edit with no original id or no text (original id %q, chat %s), not stored", originalID, chatJID)
+		return
+	}
+
+	existed, err := messageStore.ApplyEdit(originalID, chatJID, sender, content, msg.Info.Timestamp, msg.Info.IsFromMe)
+	if err != nil {
+		logger.Warnf("Failed to apply edit to message %s: %v", originalID, err)
+		return
+	}
+	if existed {
+		fmt.Printf("[edit] updated message %s in %s from %s: %s\n", originalID, chatJID, sender, content)
+	} else {
+		fmt.Printf("[edit] original %s in %s from %s was never stored, inserted edited text (timestamp is the edit time): %s\n", originalID, chatJID, sender, content)
 	}
 }
 
@@ -677,7 +725,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, host string, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, host string, port int, allowMediaSend bool) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -699,7 +747,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, host 
 			return
 		}
 
-		if req.MediaPath != "" {
+		if req.MediaPath != "" && !allowMediaSend {
 			http.Error(w, "Media sending is disabled", http.StatusBadRequest)
 			return
 		}
@@ -728,6 +776,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, host 
 			Message: message,
 		})
 	})
+
+	http.HandleFunc("/api/contacts", contactsHandler(client))
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
@@ -794,6 +844,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, host 
 
 func main() {
 	restHost := flag.String("host", "127.0.0.1", "REST API bind address; 0.0.0.0 exposes it to the network")
+	allowMediaSend := flag.Bool("allow-media-send", false, "let /api/send read media_path from disk and send it; lab use only")
 	flag.Parse()
 
 	// Set up logger
@@ -915,7 +966,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, *restHost, 8080)
+	startRESTServer(client, messageStore, *restHost, 8080, *allowMediaSend)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -1354,4 +1405,73 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// ContactMatch is one WhatsApp address-book entry matching a search.
+// PhoneJID is empty when the entry is a LID with no known phone number mapping.
+type ContactMatch struct {
+	JID      string `json:"jid"`
+	PhoneJID string `json:"phone_jid"`
+	FullName string `json:"full_name"`
+	PushName string `json:"push_name"`
+}
+
+// findContacts searches the whatsmeow contact store (the synced address book plus
+// push names) and resolves LIDs to phone JIDs, which the chats table cannot do.
+func findContacts(ctx context.Context, client *whatsmeow.Client, query string) ([]ContactMatch, error) {
+	all, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read contact store: %w", err)
+	}
+	fmt.Printf("[contacts] query %q over %d stored contacts\n", query, len(all))
+
+	needle := strings.ToLower(query)
+	var matches []ContactMatch
+	for jid, info := range all {
+		haystack := strings.ToLower(strings.Join(
+			[]string{jid.User, info.FullName, info.PushName, info.FirstName, info.BusinessName}, "\n"))
+		if !strings.Contains(haystack, needle) {
+			continue
+		}
+		match := ContactMatch{JID: jid.String(), FullName: info.FullName, PushName: info.PushName}
+		switch jid.Server {
+		case types.DefaultUserServer:
+			match.PhoneJID = jid.String()
+		case types.HiddenUserServer:
+			phone, err := client.Store.LIDs.GetPNForLID(ctx, jid)
+			if err != nil {
+				return nil, fmt.Errorf("map LID %s to phone: %w", jid, err)
+			}
+			if !phone.IsEmpty() {
+				match.PhoneJID = phone.String()
+			}
+		}
+		matches = append(matches, match)
+	}
+
+	sort.Slice(matches, func(i, j int) bool { return matches[i].JID < matches[j].JID })
+	fmt.Printf("[contacts] %d matches for %q\n", len(matches), query)
+	return matches, nil
+}
+
+func contactsHandler(client *whatsmeow.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		query := r.URL.Query().Get("query")
+		if query == "" {
+			http.Error(w, "query is required", http.StatusBadRequest)
+			return
+		}
+		matches, err := findContacts(r.Context(), client, query)
+		if err != nil {
+			fmt.Printf("[contacts] error: %v\n", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(matches)
+	}
 }

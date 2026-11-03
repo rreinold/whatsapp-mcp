@@ -8,7 +8,8 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+WHATSAPP_API_BASE_URL ="http://localhost:8080/api"
 
 @dataclass
 class Message:
@@ -47,11 +48,39 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+def get_contact_name(sender_jid: str) -> Optional[str]:
+    """Resolve a sender to the name in the user's WhatsApp contacts.
+
+    Group senders arrive as @lid ids (or bare ids); the bridge maps each lid to a phone
+    number, and the contact store is keyed by either form.
+    """
+    user = sender_jid.split('@')[0]
+    conn = sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True)
+    try:
+        row = conn.execute("""
+            SELECT COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''), NULLIF(push_name, ''))
+            FROM whatsmeow_contacts
+            WHERE their_jid IN (
+                ?,
+                ?,
+                (SELECT pn || '@s.whatsapp.net' FROM whatsmeow_lid_map WHERE lid = ?)
+            )
+            AND COALESCE(NULLIF(full_name, ''), NULLIF(first_name, ''), NULLIF(push_name, '')) IS NOT NULL
+            LIMIT 1
+        """, (f"{user}@lid", f"{user}@s.whatsapp.net", user)).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
 def get_sender_name(sender_jid: str) -> str:
     try:
+        contact_name = get_contact_name(sender_jid)
+        if contact_name:
+            return contact_name
+
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # First try matching by exact JID
         cursor.execute("""
             SELECT name
